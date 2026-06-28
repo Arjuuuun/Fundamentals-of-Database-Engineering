@@ -1,0 +1,419 @@
+# 09 — System Design Case Studies
+> Section 9 | Fundamentals of Database Engineering | Hussein Nasser
+
+---
+
+## The Mindset 🔴 CORE
+
+There is no perfect system design. What interviewers evaluate is **your thinking process** — how you identify tradeoffs, why you introduce complexity, and when you deliberately stay simple.
+
+**The design loop:**
+```
+Identify the operation
+→ Estimate its frequency
+→ Evaluate the cost
+→ Choose proportional complexity
+```
+
+**The optimization ladder (always exhaust in this order):**
+```
+Schema design → Indexes → Query optimization
+→ Pagination → Caching → Message queues
+→ Read replicas → Sharding (last resort)
+```
+
+---
+
+## Case Study 1: Twitter-like Platform
+
+### Feature 1: Post a Tweet
+
+#### Basic Architecture
+
+```
+Client → Web Server → Database
+```
+
+- **Wire protocol** — binary format a DB uses to communicate with clients. Postgres wire protocol ≠ SQL. SQL is the query language; wire protocol is how it travels over the network.
+
+```
+POST /tweet { "content": "hello world" }
+→ INSERT INTO tweets (user_id, content) VALUES (...)
+→ DB confirms → { success: true }
+```
+
+---
+
+#### Failure: DB Write Fails
+
+**Option A — Server retries:** Client hangs. Bad UX.
+
+**Option B — Message Queue** 🟡 USEFUL
+
+```
+Client → Server → Message Queue → Worker → DB
+```
+
+Server writes to queue (fast), immediately returns success. Worker handles DB writes and retries.
+
+- **Gain:** Client never sees a failed tweet. Decouples write speed from DB.
+- **Cost:** Eventual consistency, added infrastructure.
+
+> **Interview:** "I'd introduce a message queue to decouple the write path. Tradeoff is eventual consistency — acceptable for tweets, not for bank transfers."
+
+---
+
+#### Failure: Client-Server Connection Dies
+
+**Fix: Client-side SQLite**
+
+```
+Write to SQLite locally → POST to server → if fail → save to Drafts
+```
+
+**SQLite** — lightweight single-file relational DB shipping on every mobile device. No server process. Used for local state persistence. This is how Twitter Drafts works.
+
+---
+
+#### Scaling Writes: Load Balancing 🔴 CORE
+
+**Reverse proxy (standard approach):**
+
+```
+Client → Load Balancer → [Server 1, Server 2, Server 3] → DB
+```
+
+**Reverse proxy** — sits in front of backend. Client thinks the LB *is* the server. Makes requests on behalf of the client. Backend servers invisible to client.
+
+**Blue-green deployment** — two identical environments (Blue = live, Green = new). Deploy to Green, test, flip LB to Green. Blue stays as instant rollback. Requires central LB — impossible if clients pick servers directly.
+
+---
+
+#### Layer 4 vs Layer 7 Load Balancer 🔴 CORE
+
+| | Layer 4 | Layer 7 |
+|---|---|---|
+| Operates at | TCP level | HTTP level |
+| Sees | IP/ports | Method, URL, headers |
+| TLS termination | Backend | Load balancer |
+| Routing | IP/port | Content-based |
+| Use case | Raw TCP | Web APIs |
+
+Layer 7 can route GET → read replicas, POST → master. Only possible because it reads HTTP content.
+
+---
+
+#### HTTP/1.1 vs HTTP/2 🟡 USEFUL
+
+**HTTP/1.1:** One request per TCP connection at a time. Browser opens 6–10 connections per domain. LB runs out of connections fast at scale.
+
+**HTTP/2:** Multiple requests (**streams**) multiplexed over one TCP connection. Fewer connections, less memory pressure, eliminates HTTP smuggling.
+
+**Multiplexing** — multiple logical streams over one physical connection. Same concept as DB connection pooling.
+
+**HTTP smuggling** — attack exploiting HTTP/1.1 parsing ambiguity between proxy and backend. Eliminated by H2's binary framing.
+
+Recommendation: H2 front-to-back.
+
+---
+
+### Feature 2: Follow People
+
+#### Schema
+
+```sql
+CREATE TABLE profile (
+  id          SERIAL PRIMARY KEY,
+  name        TEXT,
+  bio         TEXT,
+  picture_url TEXT
+);
+
+-- Junction table
+CREATE TABLE following (
+  source_id INT,  -- person who follows
+  dest_id   INT   -- person being followed
+);
+
+CREATE INDEX idx_following_source ON following(source_id);
+CREATE INDEX idx_following_dest   ON following(dest_id);
+```
+
+**Junction table** — standard relational pattern for many-to-many relationships. One row = one relationship.
+
+```
+source_id=1, dest_id=2  →  User 1 follows User 2
+source_id=2, dest_id=1  →  User 2 follows User 1 back
+```
+
+Why not an array column on profile? Arrays break indexing, create write contention on hot accounts (Taylor Swift's row being updated 1000x/sec).
+
+Why index both columns? You query both directions. Without both indexes, one direction is a full table scan on a billion-row table.
+
+---
+
+#### Querying Counts
+
+```sql
+SELECT COUNT(*) FROM following WHERE source_id = 1;  -- following count
+SELECT COUNT(*) FROM following WHERE dest_id = 1;    -- follower count
+```
+
+Both indexed. Fast.
+
+**Why REST breaks in-memory caching between requests:** REST is stateless. Request 1 might hit Server A (data in memory). Request 2 might hit Server B (memory empty). Fix: Redis for shared state, or stateful protocol (gRPC/WebSockets).
+
+---
+
+#### Displaying Follower Names — Keyset Pagination
+
+**Bad:**
+```sql
+SELECT * FROM profile WHERE id IN (... million IDs ...);
+```
+
+**Good — fetch 10 at a time:**
+```sql
+SELECT p.name, p.picture_url
+FROM following f
+JOIN profile p ON p.id = f.source_id
+WHERE f.dest_id = 1 AND f.id > last_seen_id
+ORDER BY f.id
+LIMIT 10;
+```
+
+`OFFSET` is O(n) — scans and discards rows. Keyset pagination jumps directly to cursor position — O(1).
+
+---
+
+#### Profile View — Async Progressive Loading 🔴 CORE
+
+Three things needed: profile data, follower counts, "am I following?" button state.
+
+**Naive:** Three queries in a transaction. Triples cost of every profile view.
+
+**Better — Progressive loading:**
+```
+1. Query profile → return immediately (user sees picture/name)
+2. Async: query follower counts (appears shortly after)
+3. Async: query follow relationship (button activates last)
+```
+
+**Perceived latency** — how fast a system *feels* regardless of actual backend time. Showing something immediately beats showing nothing until everything is ready. This is exactly what Instagram does.
+
+---
+
+## Case Study 2: URL Shortener
+
+Two operations:
+- **Write:** long URL → short code → store
+- **Read:** short code → long URL → redirect
+
+---
+
+### Design 1: Integer IDs
+
+```sql
+CREATE TABLE urls (
+  id  BIGSERIAL PRIMARY KEY,
+  url TEXT NOT NULL
+);
+```
+
+**BIGSERIAL** — Postgres auto-incrementing 64-bit integer. Max ~9.2 quintillion. DB guarantees uniqueness — no application check needed.
+
+**Write:**
+```
+POST /shorten { url: "..." }
+→ INSERT INTO urls (url) VALUES (?)
+→ DB returns id = 7
+→ Return "domain.com/7"
+```
+
+No collision. No pre-check query. Insert and get ID back.
+
+**Read:**
+```
+GET /7
+→ SELECT url FROM urls WHERE id = 7
+→ 302 redirect
+```
+
+**301 vs 302:**
+- 301 Permanent — browser caches forever, you lose click analytics
+- 302 Temporary — browser always hits server, you keep analytics
+- → **Use 302 for URL shorteners**
+
+**Performance:** Primary key lookup on integer = B+ tree traversal, 3-4 IOs. Sequential inserts = no random splits. Fastest possible reads and writes.
+
+**B+ tree write caveat:** At extreme scale, index rebalancing adds overhead. Switch to LSM tree engine if write throughput becomes a bottleneck.
+
+**LSM Tree (Log-Structured Merge Tree)** — write-optimized storage. Buffers writes in memory, merges to disk in bulk. Write speed stays constant regardless of data size. Used in RocksDB, Cassandra. Tradeoff: slightly slower reads, higher background CPU.
+
+**Problem:** Sequential IDs are guessable. Attacker loops 1 to 1B and scrapes your entire database.
+
+---
+
+### Design 2: Hashed Short Codes
+
+```sql
+CREATE TABLE urls (
+  short_code VARCHAR(8) PRIMARY KEY,
+  long_url   TEXT NOT NULL
+);
+```
+
+**Generating the code:**
+```
+1. SHA-256 hash the long URL → 256-bit output
+2. Base62 encode → printable characters
+3. Take first 8 characters → short code
+```
+
+**SHA-256** — cryptographic hash. Fixed 256-bit output. Deterministic (same input = same output). One-way (cannot reverse).
+
+**Base62** — URL-safe encoding using a-z, A-Z, 0-9 (excludes + and / from Base64). 8 chars = 62⁸ ≈ 218 trillion combinations.
+
+#### Handling Collisions 🔴 CORE
+
+Truncating to 8 chars means two URLs *can* produce the same code.
+
+```
+1. Generate short code
+2. Attempt INSERT
+3. Success → return short code
+4. Duplicate primary key error → add random salt, rehash, retry
+```
+
+**Salt** — random value added to input before hashing to produce a different output. Breaks "same input = same hash" on collision.
+
+Collision probability ≈ 1 in 218 trillion per insert. Retry loop almost never runs more than once.
+
+#### Custom URL Support
+
+```
+POST /shorten { url: "...", custom: "mylink" }
+
+If custom → INSERT short_code = "mylink"
+              Duplicate → return error "code taken" (user must pick another)
+
+If no custom → hash → insert → salt+retry if collision
+```
+
+#### Design 1 vs Design 2
+
+| | Design 1 (Integer) | Design 2 (Hash) |
+|---|---|---|
+| Write speed | Fastest | Slightly slower |
+| Read speed | Fastest | Fast (indexed) |
+| Predictability | Scannable | Random |
+| Custom URLs | No | Yes |
+| Collision | Impossible | Very low, handled |
+| Use case | Internal/automated | User-facing (Bitly) |
+
+Twitter auto-shortening (user never sees short code) → Design 1. User-facing product (Bitly, TinyURL) → Design 2.
+
+---
+
+### Scaling 🔴 CORE
+
+Reads >> writes always. Every click = one read. Every URL creation = one write. Ratio can be 1000:1.
+
+**Step 1: Read replicas**
+
+```
+                    ┌─ Replica (Asia)
+Client → LB ───────┼─ Replica (Europe)
+              │     └─ Replica (US West)
+              └──── Master DB ← all writes
+```
+
+Layer 7 LB routes by HTTP method: GET → replica, POST → master.
+
+Eventual consistency applies — replica might lag behind master briefly. Acceptable here.
+
+**Step 2: Shard only when master write throughput is exhausted**
+
+Single Postgres master handles tens of thousands of writes/second. Replicas come first.
+
+**SQL Injection — always parameterize:**
+```javascript
+// WRONG
+db.query(`SELECT * FROM urls WHERE short_code = '${userInput}'`);
+
+// RIGHT
+db.query('SELECT * FROM urls WHERE short_code = $1', [userInput]);
+```
+
+---
+
+## Glossary
+
+| Term | Definition |
+|---|---|
+| Wire protocol | Binary format a DB uses to communicate. Postgres wire protocol ≠ SQL. |
+| Reverse proxy | Server forwarding client requests to backends. Client doesn't know backends exist. |
+| Transparent proxy | Layer 4 proxy. Forwards raw TCP without reading HTTP content. |
+| Blue-green deployment | Two identical environments; LB switches traffic for zero-downtime releases + instant rollback. |
+| Junction table | Table representing many-to-many via pairs of foreign keys. |
+| Multiplexing | Multiple logical streams over one physical connection. HTTP/2, connection pools. |
+| HTTP smuggling | Attack on HTTP/1.1 parsing ambiguity. Eliminated by HTTP/2 binary framing. |
+| Perceived latency | How fast a system feels. Progressive loading improves it without changing backend speed. |
+| Stateless | REST — each request standalone, server remembers nothing. |
+| Stateful | gRPC/WebSockets — connection persists, server maintains context. |
+| Cursor | DB object for fetching result rows incrementally. Avoids memory blowup on large sets. |
+| BIGSERIAL | Postgres auto-incrementing 64-bit integer. Max ~9.2 quintillion. |
+| SHA-256 | Hash function. Fixed 256-bit output. Deterministic, one-way. |
+| Base62 | URL-safe encoding: a-z, A-Z, 0-9. 8 chars ≈ 218 trillion combos. |
+| Hash collision | Two inputs producing the same truncated hash output. |
+| Salt | Random value added to input before hashing. Produces different output on retry. |
+| 301 redirect | Permanent. Browser caches — you lose analytics. |
+| 302 redirect | Temporary. Browser re-requests every time — you keep analytics. |
+| LSM Tree | Write-optimized engine. Buffers writes in memory, merges to disk. RocksDB, Cassandra. |
+
+---
+
+## Quick Revision
+
+- Three-tier: Client → Server → DB. Add LB to scale server tier.
+- Message queue decouples write from response. Gains resilience, loses strong consistency.
+- Layer 4 LB = TCP level, dumb, fast. Layer 7 = HTTP level, smart, routes by content.
+- HTTP/2 multiplexes streams over one TCP — fewer connections, less LB memory pressure.
+- Junction table for follows: `(source_id, dest_id)` — index **both** columns.
+- Never `IN (million IDs)` — paginate with `WHERE id > last_seen_id LIMIT 10`.
+- Progressive async loading = better perceived latency on frequent operations.
+- URL shortener Design 1 = integer (fast, predictable). Design 2 = hash (custom, random).
+- 302 for URL shorteners — you want click analytics.
+- Scale reads with replicas first. Shard only when master write throughput is genuinely exhausted.
+- Always parameterize queries. Never concatenate user input into SQL.
+
+---
+
+## Interview Q&A
+
+**Q: Design a URL shortener.**
+Table with `(short_code, long_url)`. Hash long URL with SHA-256, Base62 encode, take 8 chars. Insert optimistically — if duplicate primary key, add random salt and retry. Reads do primary key lookup and return 302. Scale reads with replicas via Layer 7 LB. Shard only when master is exhausted.
+
+**Q: Why 302 and not 301?**
+301 is cached permanently — users never hit your server again, you lose all click analytics. 302 ensures every click goes through your server for tracking.
+
+**Q: How do you handle hash collisions?**
+Insert optimistically. Primary key constraint fires on collision. Add random salt, rehash, retry. Probability is ~1 in 218 trillion — loop runs at most once in practice.
+
+**Q: How would you scale a URL shortener globally?**
+Read replicas per region. Layer 7 LB routes GET to nearest replica, POST to master. Eventual consistency is acceptable — users don't click their own link in the same millisecond they created it.
+
+**Q: Layer 4 vs Layer 7 load balancing?**
+Layer 4 = TCP level, sees IP/ports, fast, dumb, TLS at backend. Layer 7 = HTTP level, sees method/URL/headers, can route GET to replicas and POST to master, handles TLS termination. Use Layer 7 for web APIs.
+
+**Q: Design the follow relationship.**
+Junction table `(source_id, dest_id)`. Index both columns. Inserts are infrequent — B+ tree fine. At scale, cache follower counts in Redis and invalidate on follow/unfollow.
+
+**Q: How would you display the follow button state efficiently?**
+Progressive loading — return profile data immediately, async query the follow relationship. Button stays grayed out until async response arrives. Minimizes perceived latency on the most frequent operation.
+
+**Q: When Design 1 vs Design 2 for URL shortener?**
+Design 1 for internal/automated (Twitter auto-shortening, user never sees the code, write throughput matters). Design 2 for user-facing products (Bitly) where custom URLs and non-guessable codes matter.
+
+**Q: Tradeoff of a message queue for writes?**
+Gain: client never sees failure once request hits server, decouples write speed from DB, natural retry mechanism. Cost: eventual consistency, new infrastructure to maintain (queue + worker processes).
