@@ -1,0 +1,535 @@
+# 11 — NoSQL Architecture
+> Section 11 | Fundamentals of Database Engineering | Hussein Nasser
+
+---
+
+## The Big Picture First
+
+Before anything else, understand this one sentence:
+
+> **SQL vs NoSQL is not about which is better. It is about what data format you want and what API you use to talk to the database.**
+
+Everything else follows from this.
+
+---
+
+## How Every Database Is Built — Two Parts
+
+Any database, SQL or NoSQL, has exactly two layers:
+
+```
+┌─────────────────────────────────┐
+│         FRONTEND (API)          │  ← How you talk to the database
+│   SQL language / Mongo commands │
+├─────────────────────────────────┤
+│       STORAGE ENGINE            │  ← How data is stored on disk
+│   Pages, indexes, WAL, locks    │
+└─────────────────────────────────┘
+```
+
+### The Frontend (API Layer)
+This is how your application communicates with the database.
+- SQL databases → you write `SELECT`, `INSERT`, `JOIN` etc.
+- MongoDB → you write `db.find()`, `db.insert()` etc.
+- Redis → you write `GET key`, `SET key value` etc.
+
+The frontend defines the *language* you speak. That's it.
+
+### The Storage Engine
+This is where the real work happens. The storage engine:
+- Stores bytes on disk in pages (8KB in Postgres, 16KB in MySQL, 4KB in WiredTiger)
+- Manages indexes (B+ trees, LSM trees)
+- Handles transactions (ACID, locking, MVCC)
+- Manages WAL (Write Ahead Log) for crash recovery
+- Handles compression
+
+**Critical insight:** The storage engine doesn't care if you're storing a SQL row, a JSON document, or a graph node. To it, everything is just bytes in pages. The frontend's job is to convert your data into bytes and interpret bytes back into your data format.
+
+---
+
+## SQL vs NoSQL — The Real Difference
+
+### The SQL Era (1970s–2000s)
+Databases were always tables, rows, and columns. Data modeled as a rigid schema. You had to define every field and its type upfront. To change the schema, you took a maintenance window and altered the table.
+
+### Why NoSQL Emerged (2000s)
+As the web grew, developers faced problems:
+- "I have JSON documents. Why do I have to squeeze them into rows and columns?"
+- "My schema changes every week. I can't keep altering tables."
+- "I need flexibility — different documents can have different fields."
+
+So they built new databases with different frontends:
+- **Document stores** (MongoDB) — store JSON documents
+- **Key-value stores** (Redis, Memcached) — store anything by a string key
+- **Wide-column stores** (Cassandra) — hybrid of row and column storage
+- **Graph databases** (Neo4j) — store nodes and relationships
+
+**The storage engine underneath is often similar or identical.** What changed is the frontend API and the data format. That's the core of the SQL vs NoSQL difference.
+
+---
+
+## MongoDB Internal Architecture — The Full Evolution
+
+### What is MongoDB?
+MongoDB is a **document-based NoSQL database**. Instead of tables and rows, you work with **collections** (like tables) that hold **documents** (JSON objects).
+
+```json
+// A MongoDB document
+{
+  "_id": "507f1f77bcf86cd799439011",
+  "name": "Arjun",
+  "age": 26,
+  "skills": ["React", "Node", "Postgres"]
+}
+```
+
+Documents are stored internally as **BSON** (Binary JSON) — a binary-encoded version of JSON that is faster to parse and traverse than plain text JSON.
+
+MongoDB is **schema-less** — documents in the same collection can have completely different fields. This is the biggest reason developers love it. It's also the most abused feature.
+
+### The `_id` Field
+Every MongoDB document has an `_id` field. This is the primary key.
+
+By default, MongoDB generates an **ObjectId** for `_id`:
+- **12 bytes** total (96 bits)
+- First 4 bytes: timestamp (when it was created)
+- Next 3 bytes: machine identifier
+- Next 2 bytes: process ID
+- Last 3 bytes: random counter
+
+Why so large? Because MongoDB was designed to scale across multiple machines and shards. The ID has to be **globally unique** across all machines without coordination between them.
+
+You can override `_id` with your own value — but as you'll see, this has consequences.
+
+---
+
+### Stage 1: MMAPV1 — The Original Storage Engine
+
+MongoDB's first storage engine was called **MMAPV1** (Memory Map Version 1).
+
+**How it stored documents:**
+
+Documents were stored directly in data files on disk, one after another, uncompressed.
+
+```
+Data file:
+[Document 1 bytes][Document 2 bytes][Document 3 bytes]...
+```
+
+**How it found documents:**
+
+The `_id` index was a B+ tree. When you searched by `_id`, the B+ tree gave you a special value called a **Diskloc** (Disk Location).
+
+**Diskloc** = two 32-bit integers:
+- First 32 bits = which file the document is in
+- Second 32 bits = the byte offset within that file
+
+```
+_id index (B+ tree):
+"507f1f77..." → Diskloc { file: 0, offset: 1024 }
+
+Then: open file 0, seek to byte 1024, read document
+```
+
+This was **O(log n) + O(1)** — one B+ tree traversal to find the Diskloc, then one direct seek to the exact disk location. Extremely fast reads.
+
+**The problems with MMAPV1:**
+
+**Problem 1 — Diskloc breaks on updates:**
+If you update a document and its size increases (e.g., you add a new field), the document needs more space. Now all documents after it shift in the file. All their offsets change. All Diskloc pointers are now wrong. Every pointer after that document has to be updated. This was a nightmare to maintain.
+
+**Problem 2 — Global database lock:**
+The first version had a single global lock per database. Only one write could happen at a time across the entire database. All concurrent writes were serialized. Later improved to a collection-level lock (still terrible — imagine a table lock on every write).
+
+MMAPV1 was deprecated in MongoDB 4.0.
+
+---
+
+### Stage 2: WiredTiger — The Acquired Storage Engine
+
+In 2014, MongoDB acquired WiredTiger, a production-grade storage engine, and made it the default.
+
+**What WiredTiger brought:**
+
+**Document-level locking** — two transactions can now update two different documents in the same collection simultaneously. No collection-level lock. This made MongoDB competitive with relational databases which had row-level locks.
+
+**Compression** — BSON documents are compressed before being stored. JSON has lots of repeated field names (`"name"`, `"age"` repeated in every document). Compression eliminates this redundancy. Result: more documents fit in one page → fewer IOs to fetch the same data.
+
+**How WiredTiger stored documents:**
+
+WiredTiger introduced a **hidden clustered index** with an internal key called **recordId** (a 64-bit integer, 8 bytes).
+
+```
+Hidden index (clustered, invisible to user):
+recordId → compressed BSON document
+
+_id index (visible to user, B+ tree):
+_id value → recordId
+
+Secondary indexes (B+ tree):
+indexed field value → recordId
+```
+
+**The double lookup problem:**
+
+When you search for a document by `_id`:
+
+```
+Step 1: Search _id B+ tree → find recordId
+Step 2: Search hidden index using recordId → find document
+
+Two B+ tree traversals = O(log n) + O(log n)
+```
+
+Compare this to MMAPV1: `O(log n) + O(1)` (direct disk seek).
+
+So WiredTiger is actually slower for `_id` lookups than MMAPV1. The tradeoff: you get compression, document-level locking, and no Diskloc maintenance problem.
+
+**For writes:**
+Inserting a new document requires updating two indexes — the hidden clustered index and the `_id` index. Double the write cost.
+
+**For secondary indexes:**
+All secondary indexes point to `recordId` (8 bytes). Fixed, predictable, small size.
+
+---
+
+### Stage 3: Clustered Collections (MongoDB 5.3, 2022)
+
+MongoDB introduced **Clustered Collections** — an optional feature that fundamentally changes how documents are stored.
+
+**What changes:**
+
+The hidden WiredTiger index disappears. The `_id` index becomes the clustered index itself, with BSON documents stored directly in the leaf pages.
+
+```
+Clustered _id index:
+_id value → BSON document (directly, no pointer)
+
+Secondary indexes:
+indexed field value → _id value (not recordId anymore)
+```
+
+**Single lookup for _id searches:**
+
+```
+Step 1: Search _id B+ tree → find document immediately
+
+One B+ tree traversal = O(log n)
+```
+
+No more double lookup. Reads by `_id` are faster. Writes only update one index instead of two.
+
+**Range queries are also better:**
+
+ObjectId has a timestamp in the first 4 bytes. This means newer documents have higher `_id` values. If you store documents in order of creation, they will be physically adjacent in the clustered index. A range query like "give me all documents created today" will land on consecutive leaf pages — sequential IO instead of random IO. Massive performance improvement.
+
+**The new problem: secondary index bloat:**
+
+In the WiredTiger model, secondary indexes stored `recordId` as their pointer — always 8 bytes, fixed, small.
+
+In clustered collections, secondary indexes must now point to `_id` instead (because there's no more recordId — the data is in the `_id` index itself).
+
+The default ObjectId is 12 bytes — 4 bytes bigger than recordId. If you override `_id` with a UUID string (36 bytes with dashes), every secondary index entry now stores 36 bytes instead of 8. All your secondary indexes explode in size.
+
+Larger indexes → don't fit in memory → more disk IOs → slower queries.
+
+```
+Model          | Secondary index pointer size
+---------------|-----------------------------
+MMAPV1         | 8 bytes (Diskloc)
+WiredTiger     | 8 bytes (recordId)
+Clustered      | 12 bytes (ObjectId) or MORE if custom _id
+```
+
+**This is now identical to MySQL InnoDB** — secondary indexes point to the primary key. The lesson from MySQL applies: keep your primary key small.
+
+**Limitation:** You can only create a clustered index when creating the collection. You cannot add it later because it requires reordering all existing data (needs exclusive lock, blocks all reads and writes).
+
+---
+
+### MongoDB Evolution Summary
+
+| | MMAPV1 | WiredTiger | Clustered |
+|---|---|---|---|
+| `_id` lookup | O(log n) + O(1) | O(log n) + O(log n) | O(log n) |
+| Write cost | 1 index update | 2 index updates | 1 index update |
+| Compression | No | Yes | Yes |
+| Locking | Global/Collection | Document-level | Document-level |
+| Secondary index size | Small (Diskloc) | Small (recordId 8B) | Larger (_id 12B+) |
+| Range queries | Poor | Moderate | Excellent (if sequential IDs) |
+
+**Key rule for clustered collections:** Keep `_id` small and sequential. Default ObjectId is fine. UUID strings are dangerous.
+
+---
+
+## Memcached — Pure In-Memory Cache
+
+Memcached is a simple in-memory key-value store. It does one thing: store keys in RAM and retrieve them fast.
+
+### Memory Management — Slabs and Pages
+
+Normal programs allocate memory randomly — small objects here, large objects there. This creates **fragmentation**: gaps of unused memory scattered everywhere. When you need a new large block, there might not be a contiguous space even if total free memory is enough.
+
+Memcached avoids this by pre-allocating memory in **1MB pages** and dividing them into fixed-size **chunks** based on **slab classes**.
+
+```
+Slab class 1: chunk size = 72 bytes → 14,563 chunks per page
+Slab class 2: chunk size = 128 bytes → ...
+...
+Slab class 43: chunk size = 1MB → 1 chunk per page
+```
+
+When you store an item, Memcached finds the slab class whose chunk size is closest to your item size and puts it there. Unused space in the chunk is wasted, but fragmentation is eliminated.
+
+**Items** = key + value + metadata. Max value size = 1MB (because that's the max page size). Max key size = 250 characters.
+
+### LRU (Least Recently Used)
+
+Memory is finite. When memory is full, something has to go. Memcached evicts the **least recently used** item.
+
+Every item in Memcached is in a linked list (LRU). When an item is accessed, it moves to the front. The item at the tail (least recently used) gets evicted when memory fills up.
+
+**Consequence:** Even if you set a TTL (time to live) of 1 hour, Memcached might evict your item before that hour is up if memory pressure is high. **Never rely on Memcached for persistent storage.** Design your application assuming the data might not be there.
+
+### Threading
+
+One listener thread accepts connections. Distributes connections to a pool of worker threads. Each worker thread handles one or more connections.
+
+### Hash Table for O(1) Reads
+
+To find where an item lives in memory, Memcached uses a hash table. You give it a key, it hashes the key, does modulo by hash table size, and jumps directly to that memory location. O(1) lookup.
+
+**Collision:** Two keys can hash to the same position. Memcached handles this with chaining — a linked list at each position. If chains get too long, Memcached rehashes everything to flatten the structure.
+
+### Distributed Cache
+
+Memcached servers don't talk to each other. Distribution is entirely the **client's responsibility**. The Node.js Memcached client hashes the key to decide which server to write to, and hashes again to read from the same server. Servers are completely unaware of each other.
+
+This simplicity is a strength — no coordination overhead. But if a server dies, all keys on that server are gone.
+
+### Memcached vs Redis
+
+| | Memcached | Redis |
+|---|---|---|
+| Data types | Key-value only | Strings, lists, sets, hashes, sorted sets |
+| Persistence | None | Optional (AOF journaling or snapshots) |
+| Pub/Sub | No | Yes |
+| Clustering | Client-managed | Built-in |
+| Threads | Multi-threaded | Single-threaded (mostly) |
+| Simplicity | Extremely simple | More complex |
+
+---
+
+## Redis — In-Memory Database, Cache, and Message Broker
+
+Redis started as a pure in-memory key-value store. It became the #1 database on AWS cloud deployments.
+
+### What Makes Redis Different
+
+**In-memory first:** All data lives in RAM. Reads and writes are sub-millisecond. This is the core feature.
+
+**Rich data types:** Unlike Memcached (just key-value), Redis supports strings, lists, sets, sorted sets, hashes, and more. Each type has optimized commands.
+
+**Optional persistence:** Two modes:
+- **AOF (Append Only File)** — every write operation is logged to disk as it happens. On crash, replay the log to reconstruct state. More durable, slightly slower.
+- **Snapshotting (RDB)** — every N seconds, take a full snapshot of memory and write to disk. Faster, but you can lose up to N seconds of data on crash.
+
+You can combine both. Redis is durable by default when run via Docker.
+
+**Pub/Sub:** Redis supports publish-subscribe. Clients subscribe to a channel. When you publish a message to that channel, all subscribers receive it immediately via TCP push. Redis switches from request-response mode to push mode when you subscribe.
+
+**Replication:** Master/replica model, same as Postgres. One master accepts writes, replicas get async updates, serve reads.
+
+**Clustering:** Sharding built-in using consistent hashing. Keys are distributed across shards. Each shard can have its own replicas.
+
+### Redis Threading Model
+
+Redis is **single-threaded** for command processing. One thread handles all reads and writes. This eliminates locking complexity — no two operations run simultaneously, so there's no need for locks.
+
+This sounds like a bottleneck but isn't in practice because:
+- All operations are in-memory (microsecond-fast)
+- A single thread can handle hundreds of thousands of operations per second
+- You can spin up multiple Redis instances for more throughput
+
+There are background threads for durability (AOF writes, snapshots) and key expiration checking.
+
+### Transport Protocol
+
+Redis uses **raw TCP** on port 6379. Its wire format is called **RESP** (Redis Serialization Protocol). Simple, text-based protocol.
+
+### Redis as Cache — Hussein's Warning
+
+Hussein's strong opinion: **Redis cache is not a substitute for fixing slow queries.**
+
+If your query takes 3 seconds, putting Redis in front of it is a band-aid. The real fix is indexes, query optimization, partitioning. Use Redis cache only after exhausting database-level optimizations.
+
+Cache introduces **cache invalidation** — keeping the cache in sync with the database. This is notoriously hard to get right. Don't add this complexity unless you genuinely need it.
+
+---
+
+## CAP Theorem 🔴 CORE
+
+The CAP theorem states: in a distributed system, you can only guarantee two of these three properties simultaneously:
+
+- **C — Consistency**
+- **A — Availability**
+- **P — Partition Tolerance**
+
+### What Each Term Actually Means
+
+**Consistency (in CAP):**
+If you write something and immediately read it (from any node), you see your write. Every read returns the most recent write. **Note: This is different from ACID consistency.** ACID consistency = data integrity rules (foreign keys, constraints). CAP consistency = read-your-writes guarantee.
+
+**Availability:**
+Every request gets a response. Not necessarily the latest data — just some response (not an error or timeout). The system is always up and responding.
+
+**Partition Tolerance:**
+The system keeps working even when network communication between nodes fails. In any distributed system with multiple machines communicating over a network, partition tolerance is essentially mandatory — network failures happen. You can only opt out of partition tolerance by using a single machine with no networking.
+
+### The Real Choice: CP vs AP
+
+Since partition tolerance is required in any distributed system, the real choice is:
+
+**CP (Consistent + Partition Tolerant):**
+When a write happens, wait for all replicas to confirm before acknowledging the client. If a replica is unreachable (network partition), fail the write rather than risk inconsistency.
+
+```
+Client writes → Master writes → waits for all replicas → 
+all confirm → acknowledge client
+
+If replica unreachable → fail the write → system unavailable
+but always consistent
+```
+
+**AP (Available + Partition Tolerant):**
+When a write happens, acknowledge the client immediately. Replicas update asynchronously. If a network partition occurs, keep serving reads and writes even if some nodes have stale data.
+
+```
+Client writes → Master writes → acknowledge client immediately → 
+replicas update in background
+
+If replica unreachable → keep serving (with possibly stale data)
+→ available but inconsistent
+```
+
+### Real-World Example: YouTube 2006
+
+YouTube used MySQL with read replicas. When you updated your profile, the write went to the master and you immediately got a success response. But when you refreshed the page, the read went to a replica that hadn't received the update yet. You saw your old profile. The system chose **availability over consistency**.
+
+### ACID Consistency vs CAP Consistency
+
+| | ACID Consistency | CAP Consistency |
+|---|---|---|
+| About | Data integrity rules | Read-your-writes guarantee |
+| Example | Foreign key constraints, unique keys | After writing, every read shows the write |
+| Can tolerate violation? | No — data corruption | Sometimes yes (stale reads acceptable) |
+
+For Instagram likes: seeing 3.1M instead of 3.2M likes → acceptable inconsistency. For a bank balance: seeing wrong amount → catastrophic. Know which your system requires.
+
+### Where Different Databases Fall
+
+| Database | Type | Why |
+|---|---|---|
+| Postgres (single node) | CA | No network partition possible on single machine |
+| Postgres (with async replicas) | AP | Available, eventually consistent |
+| Postgres (with sync replicas) | CP | Consistent, may reject writes on partition |
+| MongoDB | AP by default | Async replication |
+| Cassandra | AP | Designed for availability at scale |
+| Redis (single) | CA | Single node |
+| Redis (cluster) | AP | Async replication between shards |
+
+---
+
+## NoSQL Database Types — When to Use What
+
+| Type | Examples | Best For | Key Tradeoff |
+|---|---|---|---|
+| Document store | MongoDB | Flexible JSON data, content management | Schema flexibility vs query complexity |
+| Key-value store | Redis, Memcached | Caching, sessions, leaderboards | Speed vs limited query capability |
+| Wide-column | Cassandra | Time-series, high write throughput | Write speed vs eventual consistency |
+| Graph | Neo4j | Social networks, recommendation engines | Relationship queries vs limited ecosystem |
+| Relational (SQL) | Postgres, MySQL | Structured data, ACID transactions | Consistency vs flexibility |
+
+---
+
+## Glossary
+
+| Term | Definition |
+|---|---|
+| BSON | Binary JSON. MongoDB's internal storage format. Faster to parse than plain text JSON. |
+| ObjectId | MongoDB's default `_id` type. 12 bytes. Encodes timestamp + machine ID + process ID + counter. |
+| MMAPV1 | MongoDB's original storage engine. Used memory-mapped files and Diskloc pointers. |
+| Diskloc | MMAPV1's document pointer. 64-bit value encoding file number + byte offset. O(1) to retrieve document. |
+| WiredTiger | MongoDB's current default storage engine. Acquired in 2014. Provides document-level locking and compression. |
+| recordId | WiredTiger's internal 64-bit document pointer. Replaced Diskloc. |
+| Clustered index | An index where the actual data lives in the leaf pages. Only one per table/collection. |
+| Clustered collection | MongoDB 5.3+ feature. Makes `_id` the clustered index. Single lookup for `_id` searches. |
+| Slab class | Memcached's fixed chunk size category. Items stored in nearest-fit slab class. |
+| LRU | Least Recently Used. Eviction policy — removes the least recently accessed item when memory is full. |
+| Fragmentation | Scattered gaps of unused memory making large allocations difficult. Memcached avoids with pre-allocated pages. |
+| AOF | Append Only File. Redis persistence mode. Every write logged to disk immediately. |
+| Snapshotting (RDB) | Redis persistence mode. Full memory snapshot written to disk every N seconds. |
+| RESP | Redis Serialization Protocol. Redis's wire format over TCP. |
+| CAP Theorem | In distributed systems: can only guarantee 2 of Consistency, Availability, Partition Tolerance. |
+| Network partition | When nodes in a distributed system cannot communicate. Makes CP vs AP choice necessary. |
+| CP system | Consistent + Partition Tolerant. Rejects writes if replicas unreachable. Strong consistency. |
+| AP system | Available + Partition Tolerant. Serves requests even with stale data. Eventual consistency. |
+| CAP Consistency | Read-your-writes guarantee. Different from ACID consistency. |
+| ACID Consistency | Data integrity rules — foreign keys, constraints, uniqueness. |
+| Pub/Sub | Publish-Subscribe. Publisher sends messages to a channel. All subscribers receive them. |
+| Cache invalidation | Keeping cache in sync with the source of truth. Notoriously hard to do correctly. |
+
+---
+
+## Quick Revision
+
+- SQL vs NoSQL = different frontend API + data format. Storage engine fundamentals are the same.
+- MongoDB stores JSON as BSON. Collections = tables. Documents = rows.
+- ObjectId = 12 bytes. Globally unique across machines. Has timestamp in first 4 bytes.
+- MMAPV1: Diskloc pointer → O(log n) + O(1). Breaks on document size changes. Global lock.
+- WiredTiger: recordId pointer → double lookup O(log n) + O(log n). Document-level locking. Compression.
+- Clustered collections: `_id` IS the clustered index → single lookup O(log n). Secondary indexes now point to `_id` (bigger). Identical to MySQL InnoDB.
+- Rule for clustered collections: keep `_id` small. Default ObjectId fine. UUID string = disaster.
+- Memcached: pure in-memory, slab-based memory, LRU eviction, client-managed distribution.
+- Never rely on Memcached for persistence. Design assuming data might be evicted.
+- Redis: in-memory + optional persistence (AOF/snapshots) + pub/sub + replication + clustering.
+- Redis is single-threaded for commands. Sub-millisecond latency.
+- Cache (Redis/Memcached) = last resort. Fix slow queries with indexes first.
+- CAP theorem: distributed systems can only guarantee 2 of: Consistency, Availability, Partition Tolerance.
+- Partition tolerance is mandatory in distributed systems. Real choice = CP or AP.
+- CP: consistent, may reject writes on partition. AP: always responds, may return stale data.
+- CAP consistency ≠ ACID consistency. CAP = read-your-writes. ACID = data integrity rules.
+
+---
+
+## Interview Q&A
+
+**Q: What is the difference between SQL and NoSQL?**
+The difference is in the frontend API and data format, not the storage engine fundamentals. SQL databases use tables, rows, and a structured query language. NoSQL databases use different data formats — documents, key-value pairs, graphs — with their own APIs. The underlying storage engine (pages, B+ trees, WAL) works similarly in both. Choose based on your data shape and access patterns, not hype.
+
+**Q: How does MongoDB store documents internally?**
+Documents are stored as BSON (Binary JSON). In the default WiredTiger engine, there's a hidden clustered index keyed by an internal recordId. The `_id` index maps ObjectId to recordId, requiring two B+ tree traversals to find a document. In clustered collections (5.3+), the `_id` index IS the clustered index, so documents are found in a single traversal.
+
+**Q: What are the tradeoffs of MongoDB clustered collections?**
+Benefit: single B+ tree lookup for `_id` searches, faster range queries on sequential IDs, fewer writes. Cost: secondary indexes now point to `_id` (12 bytes by default) instead of recordId (8 bytes). If you use a large custom `_id` (like a UUID string at 36 bytes), all secondary indexes bloat significantly, hurting memory and IO performance.
+
+**Q: Explain the CAP theorem.**
+In a distributed system, you can only guarantee two of: Consistency (reads always return the latest write), Availability (every request gets a response), and Partition Tolerance (system works despite network failures). Since network failures are inevitable in distributed systems, partition tolerance is required, making the real choice between CP (consistent, may reject writes on failure) and AP (always available, may return stale data).
+
+**Q: When would you choose CP vs AP?**
+CP for banking, payments, inventory — anywhere stale reads cause real harm. AP for social media likes, view counts, caches — anywhere a slightly stale read is acceptable in exchange for higher availability and throughput.
+
+**Q: What is the difference between CAP consistency and ACID consistency?**
+CAP consistency = read-your-writes. If you write something, any subsequent read from any node returns that write. ACID consistency = data integrity rules — foreign keys, unique constraints, referential integrity. They're completely different concepts that share the word "consistency."
+
+**Q: How does Redis achieve sub-millisecond latency?**
+All data lives in RAM. No disk IO for reads or writes (unless persistence is enabled, which happens in background threads). Single-threaded command processing eliminates lock contention. Simple data structures optimized for speed.
+
+**Q: When would you use Memcached vs Redis?**
+Memcached for pure caching when you need maximum simplicity — just key-value, no persistence, multi-threaded. Redis when you need richer data types, persistence, pub/sub, built-in clustering, or plan to use it as more than just a cache. In most modern systems, Redis is the better default choice.
+
+**Q: What is cache invalidation and why is it hard?**
+Cache invalidation is keeping the cache in sync with the source of truth (database). It's hard because you need to decide when to update the cache (on every write? on TTL expiry?), what to do during the window between a database write and cache update (stale reads), and how to handle failures during cache updates. Hussein's advice: don't add cache until you've exhausted database-level optimizations (indexes, query rewriting, partitioning).
+
+**Q: What is Memcached's LRU and what does it mean for your application?**
+LRU (Least Recently Used) is Memcached's eviction policy. When memory is full, it evicts the item that hasn't been accessed for the longest time. This means even items with a TTL can be evicted before they expire. Your application must always handle the case where a cached item doesn't exist — always have a fallback to the source of truth.
